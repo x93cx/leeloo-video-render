@@ -1,0 +1,51 @@
+# Рендер відео за сценаріями з контент-плану дашборду Insta Viral.
+# Запуск: сигнал з дашборду (repository_dispatch «render»), вручну (Run workflow) і раз на 4 години для підстраховки.
+name: Render videos
+
+on:
+  repository_dispatch:
+    types: [render]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */4 * * *"
+
+permissions:
+  contents: read
+  models: read # безкоштовні GitHub Models пишуть англійські промпти для картинок/кліпів
+
+concurrency:
+  group: render # один рендер за раз: другий сигнал чекає, а не дублює роботу
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core >/dev/null
+
+      - name: Render queued scripts
+        env:
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
+          POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
+          POLLINATIONS_IMAGE_MODEL: ${{ vars.POLLINATIONS_IMAGE_MODEL }}
+          POLLINATIONS_VIDEO_MODEL: ${{ vars.POLLINATIONS_VIDEO_MODEL }}
+          MEDIA_PROVIDER: pollinations
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # Порожні змінні репозиторію не мають перекривати значення за замовчуванням у воркері.
+          [ -z "$POLLINATIONS_IMAGE_MODEL" ] && unset POLLINATIONS_IMAGE_MODEL
+          [ -z "$POLLINATIONS_VIDEO_MODEL" ] && unset POLLINATIONS_VIDEO_MODEL
+          python video_worker.py --once --out videos --size 720x1280
