@@ -1000,7 +1000,19 @@ def main() -> None:
     ap.add_argument("--font", help="шлях до .ttf з кирилицею")
     ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--dna", help="локальний тест: JSON з ДНК формату ролика-донора")
+    ap.add_argument("--probe-llm", action="store_true", help="перевірити текстову модель тестовим запитом і вийти")
     args = ap.parse_args()
+
+    if args.probe_llm:  # нейтральний запит — відповідь можна показувати навіть у публічному лозі
+        chat, _ = pick_providers(use_video=False)
+        if isinstance(chat, OpenAIChat):
+            r = requests.post(f"{chat.base}/chat/completions", timeout=60,
+                              headers={"Authorization": f"Bearer {chat.key}", "Content-Type": "application/json"},
+                              json={"model": chat.model, "max_tokens": 5, "messages": [{"role": "user", "content": "Say hi"}]})
+            print(f"LLM {chat.base} → HTTP {r.status_code} {r.headers.get('Content-Type')} · {' '.join(r.text[:120].split())}")
+        else:
+            print(f"LLM: {type(chat).__name__ if chat else 'немає'}")
+        return
 
     W, H = (int(x) for x in args.size.lower().split("x"))
     chat, media = pick_providers(use_video=not args.no_video_model)
