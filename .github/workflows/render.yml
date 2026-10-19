@@ -59,7 +59,7 @@ jobs:
           [ -z "$POLLINATIONS_IMAGE_MODEL" ] && unset POLLINATIONS_IMAGE_MODEL
           [ -z "$POLLINATIONS_VIDEO_MODEL" ] && unset POLLINATIONS_VIDEO_MODEL
           if [ "${{ inputs.demo }}" = "true" ]; then
-            python video_worker.py --probe-llm || true
+            python video_worker.py --once --probe-llm || true
             python video_worker.py --file samples/demo.md --out videos --size 720x1280
           else
             python video_worker.py --once --out videos --size 720x1280
