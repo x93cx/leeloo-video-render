@@ -6,12 +6,17 @@ on:
   repository_dispatch:
     types: [render]
   workflow_dispatch:
+    inputs:
+      demo:
+        description: "Лише демо-ролик samples/demo.md (перевірка монтажу, черга не чіпається)"
+        type: boolean
+        default: false
   schedule:
     - cron: "23 */4 * * *"
 
 permissions:
   contents: read
-  models: read # безкоштовні GitHub Models пишуть англійські промпти для картинок/кліпів
+  models: read # безкоштовні GitHub Models планують кадри: запити для стоку й промпти для картинок
 
 concurrency:
   group: render # один рендер за раз: другий сигнал чекає, а не дублює роботу
@@ -32,12 +37,17 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          sudo apt-get install -y --no-install-recommends fonts-dejavu-core >/dev/null
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core fonts-montserrat >/dev/null || true
+          # Субтитрам потрібен ffmpeg з libass; якщо вбудований у imageio-ffmpeg без нього — ставимо системний.
+          FF=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+          "$FF" -hide_banner -filters | grep -q " ass " || sudo apt-get install -y --no-install-recommends ffmpeg >/dev/null
 
       - name: Render queued scripts
         env:
           DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
           DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
+          PEXELS_KEY: ${{ secrets.PEXELS_KEY }}
           POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
           POLLINATIONS_IMAGE_MODEL: ${{ vars.POLLINATIONS_IMAGE_MODEL }}
           POLLINATIONS_VIDEO_MODEL: ${{ vars.POLLINATIONS_VIDEO_MODEL }}
@@ -48,4 +58,16 @@ jobs:
           # Порожні змінні репозиторію не мають перекривати значення за замовчуванням у воркері.
           [ -z "$POLLINATIONS_IMAGE_MODEL" ] && unset POLLINATIONS_IMAGE_MODEL
           [ -z "$POLLINATIONS_VIDEO_MODEL" ] && unset POLLINATIONS_VIDEO_MODEL
-          python video_worker.py --once --out videos --size 720x1280
+          if [ "${{ inputs.demo }}" = "true" ]; then
+            python video_worker.py --file samples/demo.md --out videos --size 720x1280
+          else
+            python video_worker.py --once --out videos --size 720x1280
+          fi
+
+      - name: Keep demo video
+        if: ${{ inputs.demo }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-video
+          path: videos/demo.mp4
+          retention-days: 3

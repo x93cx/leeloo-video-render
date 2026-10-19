@@ -11,13 +11,20 @@
 Secrets (Settings → Secrets and variables → Actions → Secrets):
 - `DASHBOARD_URL` — адреса дашборду, напр. `https://example.com/viral`
 - `DASHBOARD_TOKEN` — токен імпорту з `api/config.php` дашборду
-- `POLLINATIONS_KEY` — секретний ключ `sk_…` з enter.pollinations.ai (картинки; без нього — фірмові картки)
+- `PEXELS_KEY` — безкоштовний ключ з pexels.com/api: вертикальні стокові відео для кожного плану (без нього — AI-картинки або типографіка)
+- `POLLINATIONS_KEY` — секретний ключ `sk_…` з enter.pollinations.ai (AI-картинки, запасний варіант до стоку)
 
 Variables (там само → Variables), необов'язково:
 - `POLLINATIONS_IMAGE_MODEL` — за замовчуванням `tongyi-mai/z-image-turbo` (працює на безкоштовних Quest Pollen)
 - `POLLINATIONS_VIDEO_MODEL` — порожньо = без відеокліпів (лише картинки з рухом). Напр. `alibaba/wan-2.2-fast` — справжні кліпи по 5 с за платні Pollen (≈0,01 Pollen/с)
 
 У дашборді: Налаштування → «Рендер відео» → репозиторій `власник/назва-репозиторію` і fine-grained токен з доступом лише до цього репозиторію (Contents: Read and write).
+
+## Монтаж
+- Сцени ріжуться на плани ~2 с з наїздами камери; субтитри підсвічують слово, коли воно звучить; хук великим текстом у перші ~2 с.
+- Музика: поклади свої треки (mp3/wav/m4a, з ліцензією на використання) у папку `music/` — інакше звучить згенерований біт.
+- Якщо в ролика-донора є ДНК формату (з аналізатора), темп, стиль субтитрів і типи кадрів беруться з неї.
+- Перевірка монтажу без черги: Actions → Render videos → Run workflow → «demo» → відео в Artifacts.
 
 ## Оновлення воркера
 Код воркера живе у скілі `insta-viral-analyzer/scripts/video_worker.py`; після змін скопіюй його сюди й запуш.
