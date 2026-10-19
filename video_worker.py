@@ -21,7 +21,7 @@
     FREELLMAPI_URL (http://localhost:3001), FREELLMAPI_KEY — локальний FreeLLMAPI
     POLLINATIONS_KEY (sk_…), POLLINATIONS_IMAGE_MODEL (tongyi-mai/z-image-turbo),
       POLLINATIONS_VIDEO_MODEL (порожньо = без кліпів; напр. alibaba/wan-2.2-fast — платні Pollen)
-  Промпти: FreeLLMAPI, або LLM_URL/LLM_KEY/LLM_MODEL, або в GitHub Actions — GitHub Models через GITHUB_TOKEN
+  План кадрів: FreeLLMAPI, або LLM_URL/LLM_KEY/LLM_MODEL, або Claude через дашборд (DASHBOARD_URL + DASHBOARD_TOKEN)
   Сток: PEXELS_KEY — безкоштовні вертикальні відео з pexels.com/api для кожного плану
   Музика: MUSIC_DIR або папка music/ поруч (mp3/wav/m4a); без них — згенерований біт без авторських прав
 
@@ -305,6 +305,32 @@ class OpenAIChat:
             return None
 
 
+class DashboardChat:
+    """Текстова модель через дашборд (Claude з ключем у його Налаштуваннях) — для воркера на GitHub Actions."""
+
+    def __init__(self, url: str, token: str):
+        self.base = url.rstrip("/") + "/api/index.php"
+        self.h = {"X-Api-Token": token, "User-Agent": "insta-viral-render/1.0"}
+
+    def chat_json(self, prompt: str) -> object | None:
+        r = None
+        try:
+            r = requests.post(self.base, params={"action": "render_llm"}, headers=self.h, timeout=150,
+                              json={"prompt": prompt, "max_tokens": 3000})
+            data = r.json()
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error") or f"HTTP {r.status_code}")
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", data["text"].strip())
+            try:
+                return json.loads(text)
+            except ValueError:
+                m = re.search(r"(\[.*\]|\{.*\})", text, re.S)
+                return json.loads(m.group(1)) if m else None
+        except Exception as e:  # noqa: BLE001
+            print(f"  chat (дашборд): {safe_err(e)} · HTTP {getattr(r, 'status_code', '-')}", file=sys.stderr)
+            return None
+
+
 def pick_providers(use_video: bool) -> tuple[object | None, object]:
     """Хто пише промпти (chat) і хто робить кліпи й картинки (media) — за тим, що доступно в оточенні."""
     free = FreeLLM(os.environ.get("FREELLMAPI_URL", "" if os.environ.get("GITHUB_ACTIONS") else "http://localhost:3001"),
@@ -321,9 +347,9 @@ def pick_providers(use_video: bool) -> tuple[object | None, object]:
         chat: object | None = free
     elif os.environ.get("LLM_URL"):
         chat = OpenAIChat(os.environ["LLM_URL"], os.environ.get("LLM_KEY", ""), os.environ.get("LLM_MODEL", "auto"))
-    elif os.environ.get("GITHUB_ACTIONS") and os.environ.get("GITHUB_TOKEN"):
-        chat = OpenAIChat("https://models.github.ai/inference", os.environ["GITHUB_TOKEN"],
-                          os.environ.get("LLM_MODEL", "openai/gpt-4.1-mini"))
+    elif os.environ.get("DASHBOARD_URL") and os.environ.get("DASHBOARD_TOKEN"):
+        # GitHub Models з жовтня 2026 відповідає заглушкою «OK», тож план кадрів робить Claude через дашборд.
+        chat = DashboardChat(os.environ["DASHBOARD_URL"], os.environ["DASHBOARD_TOKEN"])
     else:
         chat = None
     return chat, media
@@ -332,9 +358,12 @@ def pick_providers(use_video: bool) -> tuple[object | None, object]:
 def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
     """Для кожної сцени: англійський запит для стоку Pexels, запасний запит, промпт для AI-картинки й тип кадру."""
     for i, s in enumerate(scenes):
-        s.prompt = f"cinematic vertical shot, modern small business, {s.broll or s.on_screen}"
-        s.queries = []
-    if llm is None:
+        m = re.search(r"(?:^|\s)en:\s*(.+)$", s.broll)
+        s.queries = [m.group(1).strip()] if m else []
+        if m:
+            s.broll = s.broll[:m.start()].rstrip(" —-–")
+        s.prompt = f"cinematic vertical shot, modern small business, {s.queries[0] if s.queries else s.broll or s.on_screen}"
+    if llm is None or all(s.queries for s in scenes):
         return
     payload = [{"i": i, "visual": s.broll, "on_screen": s.on_screen, "voice": s.voice} for i, s in enumerate(scenes)]
     res = llm.chat_json(
@@ -352,7 +381,7 @@ def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
     got = {int(x["i"]): x for x in res if isinstance(x, dict) and "i" in x} if isinstance(res, list) else {}
     for i, s in enumerate(scenes):
         x = got.get(i) or {}
-        s.queries = [str(q) for q in (x.get("query"), x.get("alt")) if q]
+        s.queries = s.queries + [str(q) for q in (x.get("query"), x.get("alt")) if q and q not in s.queries]
         if x.get("prompt"):
             s.prompt = str(x["prompt"])
         if not s.tag and x.get("kind") == "text":
@@ -748,7 +777,8 @@ def build_ass(scenes: list[Scene], offsets: list[float], total: float, size: tup
             g_end = nxt if nxt is not None and nxt - g[-1][1] < 0.7 else min(g[-1][1] + 0.3, s.dur)
             texts = [ass_text(up(w[2])) for w in g]
             if style.captions == "phrase":
-                add(2, off + g[0][0], off + g_end, "Cap", f"{{{pos}}}" + " ".join(texts))
+                if off + g_end > hook_end + 0.2:  # поки на екрані хук, субтитри не дублюють його
+                    add(2, max(off + g[0][0], hook_end), off + g_end, "Cap", f"{{{pos}}}" + " ".join(texts))
                 continue
             for j, w in enumerate(g):
                 a = off + w[0]

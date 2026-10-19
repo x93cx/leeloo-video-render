@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  models: read # безкоштовні GitHub Models планують кадри: запити для стоку й промпти для картинок
 
 concurrency:
   group: render # один рендер за раз: другий сигнал чекає, а не дублює роботу
