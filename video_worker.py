@@ -5,7 +5,9 @@
 музика з приглушенням під голос. Параметри монтажу бере з ДНК формату ролика-донора, якщо вона є.
 
 Сценарій (шаблон short-form-scripts: таблиця «Время | На экране | Говорит | B-roll») розбирається на сцени.
-Тег на початку колонки B-roll задає тип плану: [stock], [screen], [face] — сток; [text] — типографіка; [ai] — AI.
+Тег на початку колонки B-roll задає тип плану: [stock], [screen], [face] — сток; [text] — типографіка; [ai] — AI;
+«— en: …» — запит для стоку, «— cut: …» — перебивка (вставка ~0,7 с поверх голосу).
+Між сценами — переходи (свайп, спалах, глітч, ривок зуму) зі звуком «вжух»; удар на хуку, «поп» на перебивках.
 Для кожного плану: сток Pexels → AI-кліп/картинка (FreeLLMAPI або Pollinations) → фон-типографіка.
 Голос: edge-tts (uk-UA / ru-RU) з межами слів. Текст «На экране» — плашкою зверху або великим по центру.
 Усе склеюється у вертикальне відео 9:16; субтитри накладає ffmpeg з libass.
@@ -82,6 +84,7 @@ class Scene:
     tag: str = ""                      # [stock] / [text] / [ai] / [screen] / [face] на початку колонки B-roll
     queries: list[str] = field(default_factory=list)
     words: list[tuple[float, float, str]] = field(default_factory=list)
+    cutaway: str = ""                  # запит стоку для короткої вставки-перебивки поверх голосу
 
 
 def _clean(cell: str) -> str:
@@ -358,12 +361,16 @@ def pick_providers(use_video: bool) -> tuple[object | None, object]:
 def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
     """Для кожної сцени: англійський запит для стоку Pexels, запасний запит, промпт для AI-картинки й тип кадру."""
     for i, s in enumerate(scenes):
+        c = re.search(r"(?:^|\s)cut:\s*(.+)$", s.broll)  # «… — cut: man facepalm» — перебивка зі сценарію
+        if c:
+            s.cutaway = c.group(1).strip()
+            s.broll = s.broll[:c.start()].rstrip(" —-–")
         m = re.search(r"(?:^|\s)en:\s*(.+)$", s.broll)
         s.queries = [m.group(1).strip()] if m else []
         if m:
             s.broll = s.broll[:m.start()].rstrip(" —-–")
         s.prompt = f"cinematic vertical shot, modern small business, {s.queries[0] if s.queries else s.broll or s.on_screen}"
-    if llm is None or all(s.queries for s in scenes):
+    if llm is None or all(s.queries and s.cutaway for s in scenes):
         return
     payload = [{"i": i, "visual": s.broll, "on_screen": s.on_screen, "voice": s.voice} for i, s in enumerate(scenes)]
     res = llm.chat_json(
@@ -375,8 +382,10 @@ def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
         '- "prompt": a concise English prompt (max 35 words) for an AI image of the same moment, realistic and '
         "cinematic, no on-screen text, no logos, no real people's names;\n"
         '- "kind": "text" if the scene is best shown as big typography only (a number, a list item, a punchline), '
-        'otherwise "stock".\n'
-        'Return only JSON: [{"i": 0, "query": "...", "alt": "...", "prompt": "...", "kind": "stock"}].\n\n'
+        'otherwise "stock";\n'
+        '- "cutaway": 2-4 English words for a 0.7-second stock insert that punctuates the line — a reaction or a '
+        'telling close-up (e.g. "man facepalm", "money falling", "clock ticking", "phone buzzing"), or "" if none.\n'
+        'Return only JSON: [{"i": 0, "query": "...", "alt": "...", "prompt": "...", "kind": "stock", "cutaway": "..."}].\n\n'
         + json.dumps(payload, ensure_ascii=False))
     got = {int(x["i"]): x for x in res if isinstance(x, dict) and "i" in x} if isinstance(res, list) else {}
     for i, s in enumerate(scenes):
@@ -386,6 +395,8 @@ def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
             s.prompt = str(x["prompt"])
         if not s.tag and x.get("kind") == "text":
             s.tag = "text"
+        if x.get("cutaway") and not s.cutaway:
+            s.cutaway = str(x["cutaway"])
 
 
 
@@ -454,6 +465,9 @@ class Style:
     music: str = "upbeat"              # upbeat | calm | none
     card_share: float = 0.0            # частка планів-типографіки без відео
     screen_share: float = 0.0          # частка планів «екран телефону/ноутбука»
+    transitions: str = "mixed"         # mixed — по черзі свайп/спалах/глітч/зум; whip | flash | glitch | zoom | cut
+    sfx: bool = True                   # «вжух» на переходах, удар на хуку, «поп» на перебивках
+    cutaways: float = 0.5              # частка сцен з короткою вставкою-перебивкою поверх голосу
     source: str = "за замовчуванням"
 
     @classmethod
@@ -478,6 +492,11 @@ class Style:
         ed = v.get("editing") or {}
         if isinstance(ed.get("zoom_punch_ins"), bool):
             st.zoom = "punch" if ed["zoom_punch_ins"] else "slow"
+        st.transitions = {"hard_cut": "cut", "whip": "whip", "fade": "flash", "mixed": "mixed",
+                          "glitch": "glitch", "zoom": "zoom"}.get(ed.get("transitions"), st.transitions)
+        if isinstance(ed.get("sound_effects"), bool):
+            st.sfx = ed["sound_effects"]
+        st.cutaways = {"none": 0.0, "some": 0.4, "many": 0.8}.get(ed.get("cutaways"), st.cutaways)
         if isinstance(v.get("hook_text_on_screen"), bool):
             st.hook = v["hook_text_on_screen"]
         mus = v.get("music")
@@ -493,7 +512,9 @@ class Style:
 
     def describe(self) -> str:
         cap = {"word": "субтитри по словах", "phrase": "субтитри фразами", "none": "без субтитрів"}[self.captions]
+        tr = {"mixed": "мікс", "whip": "свайп", "flash": "спалах", "glitch": "глітч", "zoom": "зум", "cut": "жорсткі склейки"}
         return (f"монтаж: {self.source}, план ~{self.shot_len:.1f} с, {cap}, зум: {self.zoom}, "
+                f"переходи: {tr.get(self.transitions, self.transitions)}{', звуки' if self.sfx else ''}, "
                 f"музика: {'без музики' if self.music == 'none' else self.music}")
 
 
@@ -542,6 +563,8 @@ def estimate_words(text: str, dur: float) -> list[tuple[float, float, str]]:
 class Pexels:
     """Безкоштовні стокові відео (pexels.com/api): ключ у PEXELS_KEY, ліміт 200 запитів/год і 20 000/міс."""
     API = "https://api.pexels.com/videos/search"
+    REACTIONS = ["surprised woman face", "man facepalm", "thumbs up closeup", "clock ticking closeup",
+                 "money cash closeup", "phone notification closeup", "shocked man laptop", "high five office"]
     GENERIC = ["business laptop", "smartphone in hands", "office team meeting", "city night traffic",
                "typing keyboard closeup", "coffee shop owner", "online shopping phone", "notifications phone"]
 
@@ -640,8 +663,9 @@ def media_length(path: Path) -> float:
 
 
 def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], dest: Path, zoom: str, n: int,
-                offset: float = 0.0) -> None:
-    """Один план рівно на `frames` кадрів: кроп під 9:16 і рух камери (різкий наїзд на склейці або плавний)."""
+                offset: float = 0.0, intro: str = "") -> None:
+    """Один план рівно на `frames` кадрів: кроп під 9:16, рух камери і, на початку сцени, перехід
+    (whip — свайп з розмиттям, flash — спалах, glitch — RGB-зсув і шум, zoom — ривок зуму)."""
     W, H = size
     k = 1.15 if is_video else 1.6  # запас по розміру, щоб zoompan не «тремтів»
     pw, ph = int(W * k) // 2 * 2, int(H * k) // 2 * 2
@@ -652,10 +676,21 @@ def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], d
         z = f"1+0.08*on/{frames}"
     else:
         z = "1"
+    x = "iw/2-(iw/zoom/2)"
+    if intro == "whip":  # кадр «влітає» справа: збільшення дає запас для зсуву
+        z = f"if(lt(on,6),1.35,{z})"
+        x = f"if(lt(on,6),(iw-iw/zoom)/2*(1+(6-on)/6),{x})"
+    elif intro == "zoom":
+        z = f"if(lt(on,7),1.6-0.6*on/7,{z})"
     inp = (["-stream_loop", "-1", "-ss", f"{offset:.2f}", "-i", str(src)] if is_video
            else ["-loop", "1", "-framerate", str(FPS), "-i", str(src)])
     vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={FPS},"
-          f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS},setsar=1,format=yuv420p")
+          f"zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS},setsar=1")
+    vf += {"whip": ",gblur=sigma=26:steps=2:enable='lt(n,5)'",
+           "flash": ",fade=t=in:st=0:d=0.2:color=white",
+           "glitch": ",rgbashift=rh=-16:bh=16:enable='lt(t,0.2)',noise=alls=45:allf=t:enable='lt(t,0.2)'",
+           "zoom": ",gblur=sigma=12:steps=1:enable='lt(n,4)'"}.get(intro, "")
+    vf += ",format=yuv420p"
     run([ffmpeg(), "-y", *inp, "-vf", vf, "-an", "-frames:v", str(frames), "-r", str(FPS),
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(FPS), str(dest)])
 
@@ -695,6 +730,33 @@ def music_track(style: Style, dur: float, dest: Path, seed: int) -> str:
     run([ffmpeg(), "-y", "-f", "lavfi", "-i", f"aevalsrc=exprs='{expr}':s=44100:d={dur:.2f}",
          "-af", f"lowpass=f=3200,aecho=0.6:0.4:90:0.18,{fade},volume=0.9", "-ac", "2", str(dest)])
     return f"згенерований біт {bpm} bpm"
+
+
+SFX = {  # синтезовані звуки без авторських прав: (тривалість, вираз aevalsrc, фільтри)
+    "whoosh": (0.5, "(2*random(0)-1)*pow(sin(PI*t/0.5),2)", "highpass=f=500,lowpass=f=5200,aphaser=type=t:speed=2,volume=0.9"),
+    "impact": (0.8, "0.9*sin(2*PI*(55+120*exp(-8*t))*t)*exp(-4*t)+0.4*(2*random(0)-1)*exp(-25*t)", "lowpass=f=2500"),
+    "pop": (0.14, "0.8*sin(2*PI*(1100-3500*t)*t)*exp(-28*t)", "highpass=f=200"),
+}
+
+
+def sfx_track(events: list[tuple[float, str]], total: float, work: Path) -> Path | None:
+    """Звукові ефекти на таймлайні: [(секунда, назва)] → один WAV на всю довжину ролика."""
+    if not events:
+        return None
+    for name, (d, expr, filt) in SFX.items():
+        run([ffmpeg(), "-y", "-f", "lavfi", "-i", f"aevalsrc=exprs='{expr}':s=44100:d={d}", "-af", filt, "-ac", "2",
+             str(work / f"sfx_{name}.wav")])
+    events = sorted((max(0.0, a), n) for a, n in events)[:40]
+    inputs, chain = [], []
+    for k, (a, n) in enumerate(events):
+        inputs += ["-i", str(work / f"sfx_{n}.wav")]
+        ms = int(a * 1000)
+        chain.append(f"[{k}:a]adelay={ms}|{ms}[s{k}]")
+    chain.append("".join(f"[s{k}]" for k in range(len(events))) + f"amix=inputs={len(events)}:normalize=0,"
+                 f"apad,atrim=0:{total:.3f}[a]")
+    out = work / "sfx.wav"
+    run([ffmpeg(), "-y", *inputs, "-filter_complex", ";".join(chain), "-map", "[a]", "-ac", "2", "-ar", "44100", str(out)])
+    return out
 
 
 # ---------- субтитри, хук і плашки (ASS) ----------
@@ -835,6 +897,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         offsets: list[float] = []
         t = 0.0
         shot_no = 0
+        sfx_events: list[tuple[float, str]] = []
         for i, s in enumerate(scenes):
             print(f"  сцена {i + 1}/{len(scenes)}: {safe(s.on_screen[:50] or s.voice[:50])}")
             report(4 + int(81 * i / len(scenes)), f"Сцена {i + 1} з {len(scenes)}")
@@ -853,6 +916,13 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
             n = max(1, round(want / style.shot_len))
             frames_total = max(int(round(want * FPS)), n * 12)
             per = [frames_total // n + (1 if k < frames_total % n else 0) for k in range(n)]
+            # Перебивка: другий план сцени стає вставкою ~0,7 с (реакція, деталь); решту кадрів віддаємо першому.
+            cut_at = -1
+            if pexels.ok and style.cutaways and n >= 2 and int((i + 1) * style.cutaways) > int(i * style.cutaways) \
+                    and per[1] > 26:
+                cut_at, short = 1, 21
+                per[0] += per[1] - short
+                per[1] = short
             s.dur = frames_total / FPS
             offsets.append(t)
             t += s.dur
@@ -860,6 +930,21 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
             clips: list[tuple[Path, bool, str]] = []
             for j, fr in enumerate(per):
                 kind = s.tag or "stock"
+                intro = ""
+                if j == 0 and i > 0 and style.transitions != "cut":
+                    intro = (["whip", "flash", "glitch", "zoom"][i % 4] if style.transitions == "mixed" else style.transitions)
+                    sfx_events.append((t - s.dur - 0.15, "whoosh"))
+                if j == cut_at:
+                    p = work / f"cut_{i:02d}.mp4"
+                    rx = [Pexels.REACTIONS[(shot_no + k) % len(Pexels.REACTIONS)] for k in range(2)]
+                    if pexels.clip(([s.cutaway] if s.cutaway else []) + rx, "", p, fr / FPS, seed=shot_no + 7):
+                        dest = work / f"shot_{shot_no:03d}.mp4"
+                        render_shot(p, True, fr, size, dest, "punch", 0, 0.5, intro="glitch" if i % 2 else "flash")
+                        shots.append(dest)
+                        kinds["cutaway"] = kinds.get("cutaway", 0) + 1
+                        sfx_events.append((t - s.dur + sum(per[:j]) / FPS, "pop"))
+                        shot_no += 1
+                        continue
                 if not s.tag and style.card_share and (shot_no % max(2, round(1 / style.card_share))) == 1:
                     kind = "text"
                 src, is_video, label = None, False, ""
@@ -896,7 +981,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
                     ln = media_length(src)
                     offset = ((shot_no * 2.7) % max(0.1, ln - fr / FPS)) if ln > fr / FPS + 0.5 else 0.0
                 dest = work / f"shot_{shot_no:03d}.mp4"
-                render_shot(src, is_video, fr, size, dest, style.zoom, shot_no, offset)
+                render_shot(src, is_video, fr, size, dest, style.zoom, shot_no, offset, intro=intro)
                 shots.append(dest)
                 kinds[label] = kinds.get(label, 0) + 1
                 shot_no += 1
@@ -916,14 +1001,23 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         music = work / "music.wav"
         music_label = music_track(style, total, music, seed=len(md))
         mix = work / "mix.m4a"
+        if style.sfx and style.hook:
+            sfx_events.append((0.0, "impact"))
+        sfx = sfx_track(sfx_events, total, work) if style.sfx else None
+        inputs, chain, parts = ["-i", str(work / "voice.wav")], [], []
         if music_label:
-            run([ffmpeg(), "-y", "-i", str(work / "voice.wav"), "-i", str(music), "-filter_complex",
-                 "[0:a]asplit=2[v1][v2];[1:a]volume=0.32[m];"
-                 "[m][v1]sidechaincompress=threshold=0.02:ratio=10:attack=10:release=380[md];"
-                 "[v2][md]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]",
-                 "-map", "[a]", "-c:a", "aac", "-b:a", "160k", str(mix)])
+            inputs += ["-i", str(music)]
+            chain += ["[0:a]asplit=2[v1][v2]", "[1:a]volume=0.32[m]",
+                      "[m][v1]sidechaincompress=threshold=0.02:ratio=10:attack=10:release=380[md]"]
+            parts += ["[v2]", "[md]"]
         else:
-            run([ffmpeg(), "-y", "-i", str(work / "voice.wav"), "-c:a", "aac", "-b:a", "160k", str(mix)])
+            parts.append("[0:a]")
+        if sfx:
+            inputs += ["-i", str(sfx)]
+            chain.append(f"[{len(inputs) // 2 - 1}:a]volume=0.5[fx]")
+            parts.append("[fx]")
+        chain.append("".join(parts) + f"amix=inputs={len(parts)}:duration=first:normalize=0,alimiter=limit=0.95[a]")
+        run([ffmpeg(), "-y", *inputs, "-filter_complex", ";".join(chain), "-map", "[a]", "-c:a", "aac", "-b:a", "160k", str(mix)])
 
         report(90, "Склеюю відео й субтитри")
         (work / "v.txt").write_text("".join(f"file '{p.as_posix()}'\n" for p in shots), encoding="utf-8")
@@ -949,7 +1043,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
 
 def summarize(info: dict) -> str:
     sh = info.get("shots", {})
-    names = {"stock": "сток", "ai-video": "AI-кліпи", "ai-image": "AI-картинки", "card": "типографіка"}
+    names = {"stock": "сток", "ai-video": "AI-кліпи", "ai-image": "AI-картинки", "card": "типографіка", "cutaway": "перебивки"}
     parts = ", ".join(f"{names.get(k, k)} {v}" for k, v in sh.items())
     return (f"{len(info['scenes'])} сцен, {sum(sh.values())} планів ({parts}), {info['duration_s']} с · {info['style']}"
             + (f" · {info['music']}" if info.get("music") else "")
