@@ -1229,6 +1229,8 @@ def process_queue(dash: Dashboard, chat: object | None, media: object, out_dir: 
     for it in items:
         sid = it["id"]
         print(f"Сценарій #{sid}: {safe(it.get('title') or it.get('hook_text') or '')}")
+        if it.get("avatar_note"):
+            print(f"  аватар: {it['avatar_note']}")
         try:
             dash.status(sid, "rendering", progress=0, stage="Старт рендера")
             path = out_dir / f"script-{sid}.mp4"
