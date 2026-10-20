@@ -26,6 +26,7 @@
   План кадрів: FreeLLMAPI, або LLM_URL/LLM_KEY/LLM_MODEL, або Claude через дашборд (DASHBOARD_URL + DASHBOARD_TOKEN)
   Сток: PEXELS_KEY — безкоштовні вертикальні відео з pexels.com/api для кожного плану
   Музика: MUSIC_DIR або папка music/ поруч (mp3/wav/m4a); без них — згенерований біт без авторських прав
+  Аватар: налаштування HeyGen (ключ, аватар, голос, режим) приходять з черги дашборду
 
 Залежності: pip install requests pillow imageio-ffmpeg edge-tts
 """
@@ -85,6 +86,8 @@ class Scene:
     queries: list[str] = field(default_factory=list)
     words: list[tuple[float, float, str]] = field(default_factory=list)
     cutaway: str = ""                  # запит стоку для короткої вставки-перебивки поверх голосу
+    per: list[int] = field(default_factory=list)   # кадри кожного плану сцени
+    cut_at: int = -1                   # номер плану-перебивки або -1
 
 
 def _clean(cell: str) -> str:
@@ -663,7 +666,7 @@ def media_length(path: Path) -> float:
 
 
 def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], dest: Path, zoom: str, n: int,
-                offset: float = 0.0, intro: str = "") -> None:
+                offset: float = 0.0, intro: str = "", loop: bool = True) -> None:
     """Один план рівно на `frames` кадрів: кроп під 9:16, рух камери і, на початку сцени, перехід
     (whip — свайп з розмиттям, flash — спалах, glitch — RGB-зсув і шум, zoom — ривок зуму)."""
     W, H = size
@@ -682,9 +685,10 @@ def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], d
         x = f"if(lt(on,6),(iw-iw/zoom)/2*(1+(6-on)/6),{x})"
     elif intro == "zoom":
         z = f"if(lt(on,7),1.6-0.6*on/7,{z})"
-    inp = (["-stream_loop", "-1", "-ss", f"{offset:.2f}", "-i", str(src)] if is_video
+    inp = ((["-stream_loop", "-1"] if loop else []) + ["-ss", f"{offset:.3f}", "-i", str(src)] if is_video
            else ["-loop", "1", "-framerate", str(FPS), "-i", str(src)])
-    vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={FPS},"
+    hold = "" if loop or not is_video else "tpad=stop_mode=clone:stop_duration=3,"  # кінець кліпу — тримаємо кадр
+    vf = (f"{hold}scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={FPS},"
           f"zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS},setsar=1")
     vf += {"whip": ",gblur=sigma=26:steps=2:enable='lt(n,5)'",
            "flash": ",fade=t=in:st=0:d=0.2:color=white",
@@ -787,7 +791,7 @@ def caption_groups(words: list[tuple[float, float, str]], k: int) -> list[list[t
 
 
 def build_ass(scenes: list[Scene], offsets: list[float], total: float, size: tuple[int, int], style: Style,
-              font_name: str, dest: Path) -> None:
+              font_name: str, dest: Path, hook_y: float = 0.40) -> None:
     W, H = size
     cap_size, top_size, hook_size = int(W * 0.082), int(W * 0.052), int(W * 0.098)
     ol = max(3, int(W * 0.007))
@@ -819,7 +823,7 @@ def build_ass(scenes: list[Scene], offsets: list[float], total: float, size: tup
         hook = scenes[0].on_screen or " ".join(scenes[0].voice.split()[:6])
         if hook:
             hook_end = min(1.9, scenes[0].dur)
-            add(3, 0, hook_end, "Hook", f"{{\\pos({W // 2},{int(H * 0.40)})\\fscx135\\fscy135\\t(0,180,\\fscx100\\fscy100)"
+            add(3, 0, hook_end, "Hook", f"{{\\pos({W // 2},{int(H * hook_y)})\\fscx135\\fscy135\\t(0,180,\\fscx100\\fscy100)"
                 f"\\c{hl}}}{ass_text(up(hook))}")
     for s, off in zip(scenes, offsets):
         if style.top_text and s.on_screen:
@@ -868,11 +872,108 @@ def caption_font(font: str | None) -> Path:
     return Path(find_font(True))
 
 
+# ---------- аватар HeyGen ----------
+
+class HeyGen:
+    """Аватар і голос HeyGen (API v3). Налаштування приходять із черги дашборду: key, avatar_id, voice_id, engine, mode.
+
+    Голос: якщо задано voice_id (напр. клон голосу основателя) — озвучка HeyGen з таймінгами слів, інакше edge-tts.
+    Відео: для кожної сцени з аватаром завантажуємо рівно її озвучку й просимо HeyGen синхронізувати губи —
+    платимо лише за секунди, де аватар у кадрі, а звук у ролику збігається з рухом губ."""
+    API = "https://api.heygen.com"
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.h = {"x-api-key": cfg["key"], "User-Agent": "insta-viral-render/1.0"}
+
+    def speech(self, text: str, lang: str, dest: Path) -> list[tuple[float, float, str]] | None:
+        if not self.cfg.get("voice_id"):
+            return None
+        try:
+            r = requests.post(f"{self.API}/v3/voices/speech", headers=self.h, timeout=120,
+                              json={"text": text[:5000], "voice_id": self.cfg["voice_id"], "language": lang})
+            if r.status_code != 200:
+                print(f"  heygen speech: HTTP {r.status_code}", file=sys.stderr)
+                return None
+            d = r.json()["data"]
+            dest.write_bytes(requests.get(d["audio_url"], timeout=120).content)
+            ts = d.get("word_timestamps") or []
+            words = [(float(w["start"]), float(w["end"]), str(w["word"])) for w in ts if w.get("word")]
+            return words or estimate_words(text, float(d.get("duration") or media_length(dest)))
+        except Exception as e:  # noqa: BLE001
+            print(f"  heygen speech: {safe_err(e)}", file=sys.stderr)
+            return None
+
+    def start(self, audio: Path) -> str | None:
+        """Завантажує озвучку сцени й ставить у HeyGen відео аватара під неї. Повертає video_id."""
+        try:
+            with audio.open("rb") as f:
+                r = requests.post(f"{self.API}/v3/assets", headers=self.h, timeout=120,
+                                  files={"file": (audio.name, f, "audio/mpeg")})
+            if r.status_code != 200:
+                print(f"  heygen upload: HTTP {r.status_code}", file=sys.stderr)
+                return None
+            asset = r.json()["data"]["asset_id"]
+            body = {"type": "avatar", "avatar_id": self.cfg["avatar_id"], "audio_asset_id": asset,
+                    "aspect_ratio": "9:16", "resolution": "720p", "fit": "cover", "title": "Leeloo render"}
+            if self.cfg.get("engine"):
+                body["engine"] = {"type": self.cfg["engine"]}
+            r = requests.post(f"{self.API}/v3/videos", headers=self.h, timeout=60, json=body)
+            if r.status_code != 200:
+                err = (r.json().get("error") or {}) if r.headers.get("Content-Type", "").startswith("application/json") else {}
+                print(f"  heygen video: HTTP {r.status_code} {err.get('code', '')}", file=sys.stderr)
+                return None
+            return r.json()["data"]["video_id"]
+        except Exception as e:  # noqa: BLE001
+            print(f"  heygen video: {safe_err(e)}", file=sys.stderr)
+            return None
+
+    def wait(self, jobs: dict[int, str], work: Path, report, timeout: float = 1800) -> dict[int, Path]:
+        """Чекає готовності всіх відео й качає їх. Повертає {номер сцени: mp4}."""
+        done: dict[int, Path] = {}
+        pending = dict(jobs)
+        t0 = time.time()
+        while pending and time.time() - t0 < timeout:
+            for i, vid in list(pending.items()):
+                try:
+                    r = requests.get(f"{self.API}/v3/videos/{vid}", headers=self.h, timeout=30)
+                    d = r.json().get("data") or {} if r.status_code == 200 else {}
+                except (requests.RequestException, ValueError):
+                    continue
+                if d.get("status") == "completed" and d.get("video_url"):
+                    dest = work / f"avatar_{i:02d}.mp4"
+                    dest.write_bytes(requests.get(d["video_url"], timeout=300).content)
+                    done[i] = dest
+                    del pending[i]
+                elif d.get("status") == "failed":
+                    print(f"  heygen: сцена {i + 1} — {d.get('failure_code') or 'failed'}", file=sys.stderr)
+                    del pending[i]
+            if pending:
+                report(22 + int(20 * len(done) / max(1, len(jobs))), f"Аватар HeyGen: {len(done)} з {len(jobs)} сцен")
+                time.sleep(10)
+        for i in pending:
+            print(f"  heygen: сцена {i + 1} не встигла за {int(timeout / 60)} хв — буде сток", file=sys.stderr)
+        return done
+
+
+def avatar_scenes(scenes: list[Scene], cfg: dict | None, style: Style, dna: dict | None) -> set[int]:
+    """Де в кадрі аватар: auto — хук, заклик і сцени [face] (або кожна третя, якщо в донора багато «людини в кадрі»)."""
+    if not cfg or not scenes:
+        return set()
+    face = {i for i, s in enumerate(scenes) if s.tag == "face"}
+    if cfg.get("mode") == "face":
+        return face
+    talking = float(((dna or {}).get("visual") or {}).get("shot_types", {}).get("talking_head", 0) or 0)
+    extra = {i for i in range(len(scenes)) if i % 3 == 0} if talking >= 0.3 and not face else set()
+    return face | extra | {0, len(scenes) - 1}
+
+
 # ---------- збірка ----------
 
 def produce(md: str, out_path: Path, chat: object | None, media: object, size: tuple[int, int], font: str | None,
-            on_progress=None, dna: dict | None = None) -> dict:
-    """on_progress(відсоток, етап) — для смуги прогресу в дашборді: план 4 %, сцени до 85 %, звук і склейка до 95 %."""
+            on_progress=None, dna: dict | None = None, avatar: dict | None = None) -> dict:
+    """on_progress(відсоток, етап) — для смуги прогресу в дашборді: озвучка до 20 %, аватар до 42 %, плани до 85 %,
+    звук і склейка до 95 %. avatar — налаштування HeyGen із черги (None — без аватара)."""
     report = on_progress or (lambda pct, stage: None)
     started = time.time()
     scenes = parse_scenes(md)
@@ -898,34 +999,54 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         t = 0.0
         shot_no = 0
         sfx_events: list[tuple[float, str]] = []
+        heygen = HeyGen(avatar) if avatar else None
+        # Прохід 1: озвучка й тривалість кожної сцени.
         for i, s in enumerate(scenes):
-            print(f"  сцена {i + 1}/{len(scenes)}: {safe(s.on_screen[:50] or s.voice[:50])}")
-            report(4 + int(81 * i / len(scenes)), f"Сцена {i + 1} з {len(scenes)}")
-            # Голос: edge-tts з таймінгами слів; інший TTS — з оцінкою таймінгів.
+            report(3 + int(17 * i / len(scenes)), f"Озвучка: сцена {i + 1} з {len(scenes)}")
             if s.voice:
                 a = work / f"voice_{i:02d}.mp3"
-                words = tts_words(s.voice, voice, a)
+                words = heygen.speech(s.voice, lang, a) if heygen else None
                 if words is not None:
-                    s.voice_engine, s.audio, s.words = "edge-tts:" + voice, a, words
-                elif media.speech(s.voice, a):
-                    s.voice_engine, s.audio = "tts", a
-                    s.words = estimate_words(s.voice, media_length(a))
+                    s.voice_engine, s.audio, s.words = "heygen", a, words
+                else:
+                    words = tts_words(s.voice, voice, a)
+                    if words is not None:
+                        s.voice_engine, s.audio, s.words = "edge-tts:" + voice, a, words
+                    elif media.speech(s.voice, a):
+                        s.voice_engine, s.audio = "tts", a
+                        s.words = estimate_words(s.voice, media_length(a))
             vlen = media_length(s.audio) if s.audio else 0.0
             # Темп віральних роликів: сцена триває рівно стільки, скільки звучить голос.
             want = vlen + 0.2 if vlen else max(s.end - s.start, 1.5)
             n = max(1, round(want / style.shot_len))
             frames_total = max(int(round(want * FPS)), n * 12)
-            per = [frames_total // n + (1 if k < frames_total % n else 0) for k in range(n)]
+            s.per = [frames_total // n + (1 if k < frames_total % n else 0) for k in range(n)]
             # Перебивка: другий план сцени стає вставкою ~0,7 с (реакція, деталь); решту кадрів віддаємо першому.
-            cut_at = -1
+            s.cut_at = -1
             if pexels.ok and style.cutaways and n >= 2 and int((i + 1) * style.cutaways) > int(i * style.cutaways) \
-                    and per[1] > 26:
-                cut_at, short = 1, 21
-                per[0] += per[1] - short
-                per[1] = short
+                    and s.per[1] > 26:
+                s.cut_at, short = 1, 21
+                s.per[0] += s.per[1] - short
+                s.per[1] = short
             s.dur = frames_total / FPS
             offsets.append(t)
             t += s.dur
+
+        # Аватар: відео HeyGen під озвучку обраних сцен (паралельно), поки чекаємо — нічого не рендеримо.
+        avatar_clips: dict[int, Path] = {}
+        want_avatar = avatar_scenes(scenes, avatar, style, dna)
+        if heygen and want_avatar:
+            report(21, f"Аватар HeyGen: {len(want_avatar)} сцен")
+            jobs = {i: vid for i in sorted(want_avatar) if scenes[i].audio
+                    for vid in [heygen.start(scenes[i].audio)] if vid}
+            avatar_clips = heygen.wait(jobs, work, report)
+            print(f"  аватар: {len(avatar_clips)} з {len(want_avatar)} сцен")
+
+        # Прохід 2: плани.
+        for i, s in enumerate(scenes):
+            print(f"  сцена {i + 1}/{len(scenes)}: {safe(s.on_screen[:50] or s.voice[:50])}")
+            report(43 + int(42 * i / len(scenes)), f"Сцена {i + 1} з {len(scenes)}")
+            per, cut_at, start = s.per, s.cut_at, offsets[i]
             # Візуал: кілька планів на сцену, джерела за тегом сцени, ДНК і доступністю.
             clips: list[tuple[Path, bool, str]] = []
             for j, fr in enumerate(per):
@@ -933,7 +1054,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
                 intro = ""
                 if j == 0 and i > 0 and style.transitions != "cut":
                     intro = (["whip", "flash", "glitch", "zoom"][i % 4] if style.transitions == "mixed" else style.transitions)
-                    sfx_events.append((t - s.dur - 0.15, "whoosh"))
+                    sfx_events.append((start - 0.15, "whoosh"))
                 if j == cut_at:
                     p = work / f"cut_{i:02d}.mp4"
                     rx = [Pexels.REACTIONS[(shot_no + k) % len(Pexels.REACTIONS)] for k in range(2)]
@@ -942,9 +1063,19 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
                         render_shot(p, True, fr, size, dest, "punch", 0, 0.5, intro="glitch" if i % 2 else "flash")
                         shots.append(dest)
                         kinds["cutaway"] = kinds.get("cutaway", 0) + 1
-                        sfx_events.append((t - s.dur + sum(per[:j]) / FPS, "pop"))
+                        sfx_events.append((start + sum(per[:j]) / FPS, "pop"))
                         shot_no += 1
                         continue
+                if i in avatar_clips:
+                    # Аватар: той самий фрагмент озвучки, що звучить у цей момент, — губи збігаються з голосом.
+                    dest = work / f"shot_{shot_no:03d}.mp4"
+                    render_shot(avatar_clips[i], True, fr, size, dest, style.zoom, j, sum(per[:j]) / FPS,
+                                intro=intro, loop=False)
+                    shots.append(dest)
+                    kinds["avatar"] = kinds.get("avatar", 0) + 1
+                    clips.append((avatar_clips[i], True, "avatar"))
+                    shot_no += 1
+                    continue
                 if not s.tag and style.card_share and (shot_no % max(2, round(1 / style.card_share))) == 1:
                     kind = "text"
                 src, is_video, label = None, False, ""
@@ -1022,7 +1153,9 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         report(90, "Склеюю відео й субтитри")
         (work / "v.txt").write_text("".join(f"file '{p.as_posix()}'\n" for p in shots), encoding="utf-8")
         run([ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", str(work / "v.txt"), "-c", "copy", str(work / "visual.mp4")])
-        build_ass(scenes, offsets, total, size, style, font_name, work / "captions.ass")
+        # Якщо хук говорить аватар — текст хука вище, щоб не закривати обличчя.
+        build_ass(scenes, offsets, total, size, style, font_name, work / "captions.ass",
+                  hook_y=0.2 if 0 in avatar_clips else 0.40)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         run([ffmpeg(), "-y", "-i", "visual.mp4", "-i", "mix.m4a", "-vf", "ass=captions.ass:fontsdir=fonts",
              "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
@@ -1032,7 +1165,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         "duration_s": round(total, 1), "size": f"{W}x{H}", "language": lang,
         "media": media.name if media.ok else "", "prompts": type(chat).__name__ if chat else "",
         "stock": "pexels" if pexels.ok else "", "shots": kinds, "music": music_label, "style": style.describe(),
-        "dna": bool(dna), "font": font_name,
+        "dna": bool(dna), "font": font_name, "avatar": bool(avatar_clips),
         "scenes": [{"on_screen": s.on_screen[:80], "visual": s.clip_kind, "voice": s.voice_engine, "dur": round(s.dur, 2)}
                    for s in scenes],
     }
@@ -1043,7 +1176,8 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
 
 def summarize(info: dict) -> str:
     sh = info.get("shots", {})
-    names = {"stock": "сток", "ai-video": "AI-кліпи", "ai-image": "AI-картинки", "card": "типографіка", "cutaway": "перебивки"}
+    names = {"stock": "сток", "ai-video": "AI-кліпи", "ai-image": "AI-картинки", "card": "типографіка", "cutaway": "перебивки",
+             "avatar": "аватар"}
     parts = ", ".join(f"{names.get(k, k)} {v}" for k, v in sh.items())
     return (f"{len(info['scenes'])} сцен, {sum(sh.values())} планів ({parts}), {info['duration_s']} с · {info['style']}"
             + (f" · {info['music']}" if info.get("music") else "")
@@ -1099,7 +1233,7 @@ def process_queue(dash: Dashboard, chat: object | None, media: object, out_dir: 
             dash.status(sid, "rendering", progress=0, stage="Старт рендера")
             path = out_dir / f"script-{sid}.mp4"
             info = produce(it["content"], path, chat, media, size, font, lambda pct, stage: dash.progress(sid, pct, stage),
-                           dna=it.get("format_dna"))
+                           dna=it.get("format_dna"), avatar=it.get("avatar"))
             dash.progress(sid, 96, "Завантажую на дашборд")
             dash.upload(sid, path, info)
             print(f"  готово: {info['summary']}")
