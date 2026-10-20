@@ -885,6 +885,7 @@ class HeyGen:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.h = {"x-api-key": cfg["key"], "User-Agent": "insta-viral-render/1.0"}
+        self.problem = ""  # остання помилка HeyGen людською мовою — піде в підпис відео в дашборді
 
     def speech(self, text: str, lang: str, dest: Path) -> list[tuple[float, float, str]] | None:
         if not self.cfg.get("voice_id"):
@@ -922,6 +923,9 @@ class HeyGen:
             if r.status_code != 200:
                 err = (r.json().get("error") or {}) if r.headers.get("Content-Type", "").startswith("application/json") else {}
                 print(f"  heygen video: HTTP {r.status_code} {err.get('code', '')}", file=sys.stderr)
+                self.problem = {402: "на балансі API HeyGen немає кредитів (platform.heygen.com → Billing)",
+                                401: "ключ HeyGen недійсний", 409: "аватар ще обробляється в HeyGen",
+                                429: "HeyGen обмежив частоту запитів"}.get(r.status_code, f"HeyGen відповів {r.status_code} {err.get('code', '')}")
                 return None
             return r.json()["data"]["video_id"]
         except Exception as e:  # noqa: BLE001
@@ -947,6 +951,7 @@ class HeyGen:
                     del pending[i]
                 elif d.get("status") == "failed":
                     print(f"  heygen: сцена {i + 1} — {d.get('failure_code') or 'failed'}", file=sys.stderr)
+                    self.problem = f"HeyGen не зміг зробити відео: {d.get('failure_message') or d.get('failure_code') or 'failed'}"
                     del pending[i]
             if pending:
                 report(22 + int(20 * len(done) / max(1, len(jobs))), f"Аватар HeyGen: {len(done)} з {len(jobs)} сцен")
@@ -1166,6 +1171,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         "media": media.name if media.ok else "", "prompts": type(chat).__name__ if chat else "",
         "stock": "pexels" if pexels.ok else "", "shots": kinds, "music": music_label, "style": style.describe(),
         "dna": bool(dna), "font": font_name, "avatar": bool(avatar_clips),
+        "avatar_problem": (heygen.problem if heygen and want_avatar and len(avatar_clips) < len(want_avatar) else ""),
         "scenes": [{"on_screen": s.on_screen[:80], "visual": s.clip_kind, "voice": s.voice_engine, "dur": round(s.dur, 2)}
                    for s in scenes],
     }
@@ -1181,7 +1187,8 @@ def summarize(info: dict) -> str:
     parts = ", ".join(f"{names.get(k, k)} {v}" for k, v in sh.items())
     return (f"{len(info['scenes'])} сцен, {sum(sh.values())} планів ({parts}), {info['duration_s']} с · {info['style']}"
             + (f" · {info['music']}" if info.get("music") else "")
-            + ("" if info.get("stock") else " · без PEXELS_KEY — стоку немає"))
+            + ("" if info.get("stock") else " · без PEXELS_KEY — стоку немає")
+            + (f" · аватар не вийшов: {info['avatar_problem']}" if info.get("avatar_problem") else ""))
 
 
 # ---------- дашборд ----------
