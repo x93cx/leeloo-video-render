@@ -87,6 +87,8 @@ class Scene:
     words: list[tuple[float, float, str]] = field(default_factory=list)
     cutaway: str = ""                  # запит стоку для короткої вставки-перебивки поверх голосу
     per: list[int] = field(default_factory=list)   # кадри кожного плану сцени
+    media_id: int | None = None        # свій кліп з медіатеки на всю сцену (напр. запис екрана Leeloo)
+    cut_media_id: int | None = None    # свій кліп з медіатеки як перебивка
     cut_at: int = -1                   # номер плану-перебивки або -1
 
 
@@ -361,19 +363,24 @@ def pick_providers(use_video: bool) -> tuple[object | None, object]:
     return chat, media
 
 
-def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
+def visual_plan(llm: object | None, scenes: list[Scene], lang: str, library: "Library | None" = None) -> None:
     """Для кожної сцени: англійський запит для стоку Pexels, запасний запит, промпт для AI-картинки й тип кадру."""
     for i, s in enumerate(scenes):
         c = re.search(r"(?:^|\s)cut:\s*(.+)$", s.broll)  # «… — cut: man facepalm» — перебивка зі сценарію
         if c:
             s.cutaway = c.group(1).strip()
             s.broll = s.broll[:c.start()].rstrip(" —-–")
+        lib = re.search(r"\[lib:(\d+)\]", s.broll)  # «[lib:12]» у B-roll — свій кліп вручну
+        if lib:
+            s.media_id = int(lib.group(1))
+            s.broll = (s.broll[:lib.start()] + s.broll[lib.end():]).strip()
         m = re.search(r"(?:^|\s)en:\s*(.+)$", s.broll)
         s.queries = [m.group(1).strip()] if m else []
         if m:
             s.broll = s.broll[:m.start()].rstrip(" —-–")
         s.prompt = f"cinematic vertical shot, modern small business, {s.queries[0] if s.queries else s.broll or s.on_screen}"
-    if llm is None or all(s.queries and s.cutaway for s in scenes):
+    if llm is None or (all(s.queries and s.cutaway for s in scenes) and not library):
+        library_fallback(scenes, library)
         return
     payload = [{"i": i, "visual": s.broll, "on_screen": s.on_screen, "voice": s.voice} for i, s in enumerate(scenes)]
     res = llm.chat_json(
@@ -388,7 +395,13 @@ def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
         'otherwise "stock";\n'
         '- "cutaway": 2-4 English words for a 0.7-second stock insert that punctuates the line — a reaction or a '
         'telling close-up (e.g. "man facepalm", "money falling", "clock ticking", "phone buzzing"), or "" if none.\n'
-        'Return only JSON: [{"i": 0, "query": "...", "alt": "...", "prompt": "...", "kind": "stock", "cutaway": "..."}].\n\n'
+        + (('\nWe also have our own clip library — prefer it over stock whenever a clip shows exactly what the line is '
+             'about (above all, scenes about the Leeloo product itself). Library: ' + json.dumps(library.catalog(), ensure_ascii=False)
+             + '\nAlso return per scene "media_id": id of a library clip (kind screen, broll or logo) to play as the '
+             'scene footage, or null; and "cut_media_id": id of a library clip (kind cutaway or broll) for the 0.7 s insert, '
+             'or null. Use each clip at most twice and only when it really fits.\n') if library else '')
+        + 'Return only JSON: [{"i": 0, "query": "...", "alt": "...", "prompt": "...", "kind": "stock", "cutaway": "..."'
+        + (', "media_id": null, "cut_media_id": null' if library else '') + '}].\n\n'
         + json.dumps(payload, ensure_ascii=False))
     got = {int(x["i"]): x for x in res if isinstance(x, dict) and "i" in x} if isinstance(res, list) else {}
     for i, s in enumerate(scenes):
@@ -400,6 +413,24 @@ def visual_plan(llm: object | None, scenes: list[Scene], lang: str) -> None:
             s.tag = "text"
         if x.get("cutaway") and not s.cutaway:
             s.cutaway = str(x["cutaway"])
+        if library:
+            for key, attr in (("media_id", "media_id"), ("cut_media_id", "cut_media_id")):
+                v = x.get(key)
+                if getattr(s, attr) is None and isinstance(v, (int, str)) and str(v).isdigit() and int(v) in library.items:
+                    setattr(s, attr, int(v))
+    library_fallback(scenes, library)
+
+
+def library_fallback(scenes: list[Scene], library: "Library | None") -> None:
+    """Без LLM (або якщо він нічого не обрав) — підбір своїх кліпів за збігом слів."""
+    if not library:
+        return
+    for s in scenes:
+        text = f"{s.voice} {s.on_screen} {s.broll}"
+        if s.media_id is None:
+            s.media_id = library.match(text, ("screen", "broll", "logo"))
+        if s.cut_media_id is None:
+            s.cut_media_id = library.match(text, ("cutaway",))
 
 
 
@@ -444,6 +475,56 @@ def find_font(bold: bool = True) -> str:
             if (d / n).exists():
                 return str(d / n)
     raise RuntimeError("Не знайдено шрифт з кирилицею — передай --font шлях до .ttf")
+
+
+# ---------- медіатека перебивок ----------
+
+class Library:
+    """Власні кліпи з дашборду (записи екрана Leeloo, кадри продукту, реакції). Каталог приходить без файлів,
+    кліп качається лише тоді, коли його поставили в ролик."""
+
+    def __init__(self, items: list[dict], fetch):
+        self.items = {int(m["id"]): m for m in items}
+        self.fetch = fetch          # fetch(id, dest) -> bool
+        self.cache: dict[int, Path] = {}
+        self.used: set[int] = set()
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+    def catalog(self) -> list[dict]:
+        return [{"id": m["id"], "kind": m["kind"], "title": m["title"], "description": m.get("description") or "",
+                 "tags": m.get("tags") or "", "seconds": m.get("duration_s")} for m in self.items.values()]
+
+    def path(self, mid: int | None, work: Path) -> Path | None:
+        if mid is None or mid not in self.items:
+            return None
+        if mid not in self.cache:
+            dest = work / f"lib_{mid}.mp4"
+            if not self.fetch(mid, dest):
+                return None
+            self.cache[mid] = dest
+        self.used.add(mid)
+        return self.cache[mid]
+
+    def fit(self, mid: int) -> str:
+        """Горизонтальні кліпи (записи екрана) — цілком по центру на розмитому фоні, а не обрізані до 9:16."""
+        m = self.items.get(mid) or {}
+        w, h = m.get("width") or 0, m.get("height") or 0
+        return "contain" if w and h and w / h > 0.8 else "cover"
+
+    def match(self, text: str, kinds: tuple[str, ...]) -> int | None:
+        """Запасний підбір без LLM: збіг слів сцени з назвою, описом і тегами кліпу (основи слів по 5 літер)."""
+        stems = lambda s: {w[:5] for w in re.findall(r"\w{4,}", s.lower())}  # noqa: E731
+        want = stems(text)
+        best, score = None, 1
+        for m in self.items.values():
+            if m["kind"] not in kinds:
+                continue
+            sc = len(want & stems(" ".join(str(m.get(k) or "") for k in ("title", "description", "tags"))))
+            if sc > score:
+                best, score = int(m["id"]), sc
+        return best
 
 
 # ---------- стиль монтажу (ДНК формату) ----------
@@ -666,7 +747,7 @@ def media_length(path: Path) -> float:
 
 
 def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], dest: Path, zoom: str, n: int,
-                offset: float = 0.0, intro: str = "", loop: bool = True) -> None:
+                offset: float = 0.0, intro: str = "", loop: bool = True, fit: str = "cover") -> None:
     """Один план рівно на `frames` кадрів: кроп під 9:16, рух камери і, на початку сцени, перехід
     (whip — свайп з розмиттям, flash — спалах, glitch — RGB-зсув і шум, zoom — ривок зуму)."""
     W, H = size
@@ -688,14 +769,20 @@ def render_shot(src: Path, is_video: bool, frames: int, size: tuple[int, int], d
     inp = ((["-stream_loop", "-1"] if loop else []) + ["-ss", f"{offset:.3f}", "-i", str(src)] if is_video
            else ["-loop", "1", "-framerate", str(FPS), "-i", str(src)])
     hold = "" if loop or not is_video else "tpad=stop_mode=clone:stop_duration=3,"  # кінець кліпу — тримаємо кадр
-    vf = (f"{hold}scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={FPS},"
-          f"zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS},setsar=1")
+    if fit == "contain":  # кадр цілком по центру, фон — той самий кадр, розмитий і притемнений
+        pre = (f"[0:v]{hold}fps={FPS},split[a][b];"
+               f"[a]scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},boxblur=24:2,eq=brightness=-0.12[bg];"
+               f"[b]scale={int(pw * 0.96) // 2 * 2}:{ph}:force_original_aspect_ratio=decrease[fg];"
+               f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,")
+    else:
+        pre = f"[0:v]{hold}scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},fps={FPS},"
+    vf = pre + f"zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS},setsar=1"
     vf += {"whip": ",gblur=sigma=26:steps=2:enable='lt(n,5)'",
            "flash": ",fade=t=in:st=0:d=0.2:color=white",
            "glitch": ",rgbashift=rh=-16:bh=16:enable='lt(t,0.2)',noise=alls=45:allf=t:enable='lt(t,0.2)'",
            "zoom": ",gblur=sigma=12:steps=1:enable='lt(n,4)'"}.get(intro, "")
-    vf += ",format=yuv420p"
-    run([ffmpeg(), "-y", *inp, "-vf", vf, "-an", "-frames:v", str(frames), "-r", str(FPS),
+    vf += ",format=yuv420p[v]"
+    run([ffmpeg(), "-y", *inp, "-filter_complex", vf, "-map", "[v]", "-an", "-frames:v", str(frames), "-r", str(FPS),
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(FPS), str(dest)])
 
 
@@ -976,7 +1063,8 @@ def avatar_scenes(scenes: list[Scene], cfg: dict | None, style: Style, dna: dict
 # ---------- збірка ----------
 
 def produce(md: str, out_path: Path, chat: object | None, media: object, size: tuple[int, int], font: str | None,
-            on_progress=None, dna: dict | None = None, avatar: dict | None = None) -> dict:
+            on_progress=None, dna: dict | None = None, avatar: dict | None = None,
+            library: "Library | None" = None) -> dict:
     """on_progress(відсоток, етап) — для смуги прогресу в дашборді: озвучка до 20 %, аватар до 42 %, плани до 85 %,
     звук і склейка до 95 %. avatar — налаштування HeyGen із черги (None — без аватара)."""
     report = on_progress or (lambda pct, stage: None)
@@ -990,7 +1078,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
     pexels = Pexels(os.environ.get("PEXELS_KEY", ""), {"uk": "uk-UA", "ru": "ru-RU"}.get(lang, "en-US"))
     W, H = size
     report(2, "Планую кадри")
-    visual_plan(chat, scenes, lang)
+    visual_plan(chat, scenes, lang, library)
     font_path = caption_font(font)
     fam, sub = ImageFont.truetype(str(font_path), 20).getname()
     font_name = fam if (sub or "Regular") in ("Regular", "Bold", "Normal") or sub in fam else f"{fam} {sub}"
@@ -1028,8 +1116,8 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
             s.per = [frames_total // n + (1 if k < frames_total % n else 0) for k in range(n)]
             # Перебивка: другий план сцени стає вставкою ~0,7 с (реакція, деталь); решту кадрів віддаємо першому.
             s.cut_at = -1
-            if pexels.ok and style.cutaways and n >= 2 and int((i + 1) * style.cutaways) > int(i * style.cutaways) \
-                    and s.per[1] > 26:
+            if (pexels.ok or s.cut_media_id is not None) and style.cutaways and n >= 2 \
+                    and int((i + 1) * style.cutaways) > int(i * style.cutaways) and s.per[1] > 26:
                 s.cut_at, short = 1, 21
                 s.per[0] += s.per[1] - short
                 s.per[1] = short
@@ -1062,15 +1150,30 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
                     sfx_events.append((start - 0.15, "whoosh"))
                 if j == cut_at:
                     p = work / f"cut_{i:02d}.mp4"
+                    own = library.path(s.cut_media_id, work) if library else None
                     rx = [Pexels.REACTIONS[(shot_no + k) % len(Pexels.REACTIONS)] for k in range(2)]
-                    if pexels.clip(([s.cutaway] if s.cutaway else []) + rx, "", p, fr / FPS, seed=shot_no + 7):
+                    if own or pexels.clip(([s.cutaway] if s.cutaway else []) + rx, "", p, fr / FPS, seed=shot_no + 7):
                         dest = work / f"shot_{shot_no:03d}.mp4"
-                        render_shot(p, True, fr, size, dest, "punch", 0, 0.5, intro="glitch" if i % 2 else "flash")
+                        render_shot(own or p, True, fr, size, dest, "punch", 0, 0.3 if own else 0.5,
+                                    intro="glitch" if i % 2 else "flash", fit=library.fit(s.cut_media_id) if own else "cover")
                         shots.append(dest)
                         kinds["cutaway"] = kinds.get("cutaway", 0) + 1
                         sfx_events.append((start + sum(per[:j]) / FPS, "pop"))
                         shot_no += 1
                         continue
+                own = library.path(s.media_id, work) if library and i not in avatar_clips else None
+                if own:
+                    # Свій кліп (напр. запис екрана Leeloo) іде безперервно через усі плани сцени.
+                    ln = media_length(own)
+                    pos = sum(per[:j]) / FPS
+                    offset = pos % max(0.1, ln - fr / FPS) if ln > fr / FPS + 0.3 else 0.0
+                    dest = work / f"shot_{shot_no:03d}.mp4"
+                    render_shot(own, True, fr, size, dest, style.zoom, j, offset, intro=intro, fit=library.fit(s.media_id))
+                    shots.append(dest)
+                    kinds["library"] = kinds.get("library", 0) + 1
+                    clips.append((own, True, "library"))
+                    shot_no += 1
+                    continue
                 if i in avatar_clips:
                     # Аватар: той самий фрагмент озвучки, що звучить у цей момент, — губи збігаються з голосом.
                     dest = work / f"shot_{shot_no:03d}.mp4"
@@ -1171,6 +1274,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
         "media": media.name if media.ok else "", "prompts": type(chat).__name__ if chat else "",
         "stock": "pexels" if pexels.ok else "", "shots": kinds, "music": music_label, "style": style.describe(),
         "dna": bool(dna), "font": font_name, "avatar": bool(avatar_clips),
+        "library_used": sorted(library.used) if library else [],
         "avatar_problem": (heygen.problem if heygen and want_avatar and len(avatar_clips) < len(want_avatar) else ""),
         "scenes": [{"on_screen": s.on_screen[:80], "visual": s.clip_kind, "voice": s.voice_engine, "dur": round(s.dur, 2)}
                    for s in scenes],
@@ -1183,7 +1287,7 @@ def produce(md: str, out_path: Path, chat: object | None, media: object, size: t
 def summarize(info: dict) -> str:
     sh = info.get("shots", {})
     names = {"stock": "сток", "ai-video": "AI-кліпи", "ai-image": "AI-картинки", "card": "типографіка", "cutaway": "перебивки",
-             "avatar": "аватар"}
+             "avatar": "аватар", "library": "свої кліпи"}
     parts = ", ".join(f"{names.get(k, k)} {v}" for k, v in sh.items())
     return (f"{len(info['scenes'])} сцен, {sum(sh.values())} планів ({parts}), {info['duration_s']} с · {info['style']}"
             + (f" · {info['music']}" if info.get("music") else "")
@@ -1207,6 +1311,33 @@ class Dashboard:
         if not data.get("ok"):
             raise RuntimeError(data.get("error") or f"HTTP {r.status_code}")
         return data
+
+    def media_catalog(self) -> list[dict]:
+        try:
+            return self._check(requests.get(self.base, params={"action": "media_catalog"}, headers=self.h, timeout=30))["items"]
+        except Exception as e:  # noqa: BLE001 — старий дашборд без медіатеки
+            print(f"  медіатека: {safe_err(e)}", file=sys.stderr)
+            return []
+
+    def media_file(self, mid: int, dest: Path) -> bool:
+        try:
+            with requests.get(self.base, params={"action": "media_file", "id": mid}, headers=self.h, stream=True, timeout=300) as r:
+                if r.status_code != 200 or "json" in r.headers.get("Content-Type", ""):
+                    return False
+                with dest.open("wb") as f:
+                    for chunk in r.iter_content(1 << 16):
+                        f.write(chunk)
+            return dest.stat().st_size > 0
+        except requests.RequestException as e:
+            print(f"  медіатека: {safe_err(e)}", file=sys.stderr)
+            return False
+
+    def media_used(self, ids: list[int]) -> None:
+        if ids:
+            try:
+                requests.post(self.base, params={"action": "media_used"}, headers=self.h, timeout=30, json={"ids": ids})
+            except requests.RequestException:
+                pass
 
     def queue(self) -> list[dict]:
         return self._check(requests.get(self.base, params={"action": "video_queue"}, headers=self.h, timeout=30))["items"]
@@ -1233,6 +1364,9 @@ class Dashboard:
 
 def process_queue(dash: Dashboard, chat: object | None, media: object, out_dir: Path, size: tuple[int, int], font: str | None) -> int:
     items = dash.queue()
+    catalog = dash.media_catalog() if items else []
+    if items:
+        print(f"Медіатека: {len(catalog)} своїх кліпів")
     for it in items:
         sid = it["id"]
         print(f"Сценарій #{sid}: {safe(it.get('title') or it.get('hook_text') or '')}")
@@ -1242,9 +1376,11 @@ def process_queue(dash: Dashboard, chat: object | None, media: object, out_dir: 
             dash.status(sid, "rendering", progress=0, stage="Старт рендера")
             path = out_dir / f"script-{sid}.mp4"
             info = produce(it["content"], path, chat, media, size, font, lambda pct, stage: dash.progress(sid, pct, stage),
-                           dna=it.get("format_dna"), avatar=it.get("avatar"))
+                           dna=it.get("format_dna"), avatar=it.get("avatar"),
+                           library=Library(catalog, dash.media_file) if catalog else None)
             dash.progress(sid, 96, "Завантажую на дашборд")
             dash.upload(sid, path, info)
+            dash.media_used(info.get("library_used") or [])
             print(f"  готово: {info['summary']}")
         except Exception as e:  # noqa: BLE001
             print(f"  помилка: {safe_err(e)} (повний текст — у дашборді)", file=sys.stderr)
